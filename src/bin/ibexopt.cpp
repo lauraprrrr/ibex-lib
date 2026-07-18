@@ -129,6 +129,57 @@ int main(int argc, char** argv) {
 			cout << "  file loaded:\t\t" << filename.Get() << endl;
 		}
 
+
+
+		/**************************** 
+		 ** INICIO MODIFICACIONES **
+		****************************/
+
+		// Extraer nombre del archivo y carpeta del benchmark
+		string full_path = filename.Get();
+
+		// Encontrar la posición de "optim/" en la ruta
+		size_t optim_pos = full_path.find("optim/");
+		string folder_name = "unknown";
+		string file_name_only = "unknown";
+
+		if (optim_pos != string::npos) {
+			// Extraer la carpeta (easy, medium, hard, etc.)
+			size_t folder_start = optim_pos + 6; // longitud de "optim/"
+			size_t folder_end = full_path.find('/', folder_start);
+			
+			if (folder_end != string::npos) {
+				folder_name = full_path.substr(folder_start, folder_end - folder_start);
+				
+				// Extraer el nombre del archivo sin extensión
+				size_t file_start = folder_end + 1;
+				size_t file_end = full_path.find_last_of('.');
+				if (file_end != string::npos && file_end > file_start) {
+					file_name_only = full_path.substr(file_start, file_end - file_start);
+				} else {
+					file_name_only = full_path.substr(file_start);
+				}
+			} else {
+				// Si no hay más barras, usar el nombre completo después de optim
+				size_t last_dot = full_path.find_last_of('.');
+				file_name_only = (last_dot != string::npos) ? 
+								full_path.substr(optim_pos + 6, last_dot - optim_pos - 6) : 
+								full_path.substr(optim_pos + 6);
+			}
+		}
+
+		// Solo crear directorios y pasar información al Optimizer
+		system("mkdir -p /home/cristopher/Escritorio/dataset/input");
+		system("mkdir -p /home/cristopher/Escritorio/dataset/output");
+
+		// Establecer variable de entorno para que Optimizer.cpp sepa qué benchmark se está ejecutando
+		string benchmark_id = folder_name + "_" + file_name_only;
+		setenv("CURRENT_BENCHMARK", benchmark_id.c_str(), 1);
+
+		/****************************
+		 ** FIN MODIFICACIONES **
+		****************************/
+
 		if (rel_eps_f) {
 			config.set_rel_eps_f(rel_eps_f.Get());
 
@@ -318,11 +369,11 @@ int main(int argc, char** argv) {
 
 		o.get_data().save(output_cov_file.c_str());
 
-		if (!quiet) {
-			cout << " results written in " << output_cov_file << "\n";
-			if (overwitten)
-				cout << " (old file saved in " << cov_copy << ")\n";
-		}
+		// if (!quiet) {
+		// 	cout << " results written in " << output_cov_file << "\n";
+		// 	if (overwitten)
+		// 		cout << " (old file saved in " << cov_copy << ")\n";
+		// }
 
 		delete sys;
 
