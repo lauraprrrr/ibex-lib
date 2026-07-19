@@ -1,5 +1,5 @@
 //                                  I B E X
-// File        : ibex_Optimizer.cpp (JSON + ACTIVACIÓN + ESTADÍSTICAS BISECTORES)
+// File        : ibex_Optimizer.cpp (RL DYNAMIC HYPER-HEURISTIC FOR NODE SELECTION)
 //============================================================================
 
 #include "ibex_Optimizer.h"
@@ -23,28 +23,27 @@
 #include <limits> 
 #include <cmath>
 #include <sstream> 
-#include <map> // [NUEVO] Para mapear nombres
 
 using namespace std;
 
-// ============================================================================
-//  CONFIGURACIÓN Y VARIABLES GLOBALES
-// ============================================================================
 const int MIN_DEPTH = 5;          
 const int STAGNATION_LIMIT = 10;  
 
-// Métricas de Tiempo
+const int K_ITERATIONS = 100;    
+int current_macro_action = 0;    
+double old_gap = 0.0;            
+int nodes_pruned_in_k_step = 0;  
+
+const double TERMINAL_BONUS_SUCCESS         =  5.0;  
+const double TERMINAL_BONUS_TIMEOUT         = -5.0;  
+const double TERMINAL_BONUS_UNREACHED_PREC  = -3.0;  
+const double TERMINAL_BONUS_NEUTRAL         =  0.0;  
+
 static double g_python_time = 0.0;
 static long g_wall_time = 0;
 static std::chrono::time_point<std::chrono::high_resolution_clock> g_start_wall_time;
+static long g_action_counts[4] = {0, 0, 0, 0};
 
-// [NUEVO] Contadores de Bisectores (0..5 + Default)
-// 0:LSMEAR, 1:LF, 2:RR, 3:SM, 4:SS, 5:SSR, 6:Default(Sin Red)
-static long g_bisector_counts[7] = {0, 0, 0, 0, 0, 0, 0}; 
-
-// ============================================================================
-//         COMUNICACIÓN CON MODELO
-// ============================================================================
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -93,35 +92,6 @@ int parse_decision_from_json(const std::string& json_str) {
     }
     size_t start = pos + key.length();
     try { return std::stoi(json_str.substr(start)); } catch (...) { return -1; }
-}
-
-// ============================================================================
-//  PREPROCESAMIENTO
-// ============================================================================
-double const UMBRAL_CERO = 1e-7;
-enum class FeatureType { LbFObj, UbFObj, BiggerDiam, GenericFeature };
-
-double preprocess_feature(double val, FeatureType type) {
-    if (std::isnan(val)) return 0.0;
-    if (std::abs(val) < UMBRAL_CERO) val = 0.0;
-    switch (type) {
-        case FeatureType::LbFObj: return std::max(-1e7, std::min(val, 1e7));
-        case FeatureType::UbFObj: return std::min(val, 1e6);
-        case FeatureType::BiggerDiam: return std::min(val, 1e6);
-        default: if (std::isinf(val)) return (val > 0) ? DBL_MAX : -DBL_MAX; break;
-    }
-    return val;
-}
-
-FeatureType string_to_feature_type(const std::string& feature_name) {
-    if (feature_name == "lb_f_obj") return FeatureType::LbFObj;
-    if (feature_name == "ub_f_obj") return FeatureType::UbFObj;
-    if (feature_name == "bigger_diam") return FeatureType::BiggerDiam;
-    return FeatureType::GenericFeature;
-}
-
-double preprocess_feature(double raw_value, const std::string& feature_name) {
-    return preprocess_feature(raw_value, string_to_feature_type(feature_name));
 }
 
 namespace ibex {
@@ -221,9 +191,8 @@ void Optimizer::start(const IntervalVector& init_box, double obj_init_bound) {
     bsc.add_property(init_box, root->prop); ctc.add_property(init_box, root->prop); buffer.add_property(init_box, root->prop); loup_finder.add_property(init_box, root->prop);
     loup_changed=false; initial_loup=obj_init_bound; loup_point = init_box; time=0;
     
-    // Inicializar Globales
     g_python_time = 0.0; g_wall_time = 0; g_start_wall_time = std::chrono::high_resolution_clock::now();
-    for(int k=0; k<7; k++) g_bisector_counts[k] = 0; // Reset contadores
+    for(int k=0; k<4; k++) g_action_counts[k] = 0; 
     
     connect_to_model_server();
     if (cov) delete cov; cov = new CovOptimData(extended_COV? n+1 : n, extended_COV);
@@ -240,141 +209,250 @@ void Optimizer::start(const CovOptimData& data, double obj_init_bound) {
     }
     loup_changed=false; initial_loup=obj_init_bound; time=0;
     g_python_time = 0.0; g_wall_time = 0; g_start_wall_time = std::chrono::high_resolution_clock::now();
-    for(int k=0; k<7; k++) g_bisector_counts[k] = 0;
+    for(int k=0; k<4; k++) g_action_counts[k] = 0;
     connect_to_model_server();
     if (cov) delete cov; cov = new CovOptimData(extended_COV? n+1 : n, extended_COV);
     cov->data->_optim_time = data.time(); cov->data->_optim_nb_cells = data.nb_cells();
 }
 
 Optimizer::Status Optimizer::optimize() {
-    Timer timer; auto now = std::chrono::high_resolution_clock::now(); timer.start(); Timer python_timer;
-    pid_t pid1 = getpid(); update_uplo();
+    Timer timer;
+    timer.start();
+
+    update_uplo();
 
     try {
-        CellBeamSearch * thebuffer = dynamic_cast<CellBeamSearch*>(&buffer);
-        LoupFinderDefault * lfd = dynamic_cast<LoupFinderDefault*>(&loup_finder);
-        queue<Cell*> aux; aux.push(thebuffer->top()); 
+        uplo = buffer.minimum(); 
+        old_gap = (loup == POS_INFINITY) ? 1e5 : (loup - uplo); 
+        double initial_gap = old_gap;
+        double old_uplo = uplo;
         
-        double prec = 1e-7;
-        OptimLargestFirst bisector_olf(goal_var, true, prec, 0.5);
-        RoundRobin bisector_rr(prec, 0.5);
-        System system = lfd->finder_x_taylor.sys;
-        SmearMax bisector_sm(system, prec);
-        SmearSum bisector_ss(system, prec);
-        SmearSumRelative bisector_ssr(system, prec);
+        nodes_pruned_in_k_step = 0;
+        current_macro_action = 0; 
+        
+        Cell* next_node = nullptr; 
+        bool alternate_fair = true; 
 
-        int iterations_without_improvement = 0;
-        double last_uplo = uplo;
+        while (!buffer.empty() || next_node != nullptr) {
 
-        while (!thebuffer->empty()) {
-            loup_changed=false;
-            Cell *c = thebuffer->top();
-            
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - g_start_wall_time).count();
-            if (elapsed >= 1800) { status = TIME_OUT; g_wall_time = elapsed; goto end; }
-
-            // =========================================================
-            //  ESTRATEGIA DE ACTIVACIÓN
-            // =========================================================
-            bool call_neural_network = false;
-
-            if (uplo > last_uplo) {
-                iterations_without_improvement = 0;
-                last_uplo = uplo;
-            } else {
-                iterations_without_improvement++;
-            }
-
-            if (c->depth >= MIN_DEPTH) {
-                if (iterations_without_improvement >= STAGNATION_LIMIT) {
-                    call_neural_network = true;
-                }
-            }
-            
-            Bsc* chosen_bsc = &bsc; 
-            int selected_heuristic_id = 6; // 6 = Default (No Red)
-
-            if (call_neural_network) {
-                // --- CONSTRUIR JSON ---
-                int variables = n;
-                int restricciones = lfd->finder_x_taylor.sys.nb_ctr;
-                int depth = c->depth;
-                double ub_f_obj = c->box[goal_var].ub();
-                double lb_f_obj = c->box[goal_var].lb();
-                double bigger_diam = c->box.max_diam();
-                double diametro_pequeno = c->box.diam().min();
-
-                lb_f_obj = preprocess_feature(lb_f_obj, "lb_f_obj");
-                ub_f_obj = preprocess_feature(ub_f_obj, "ub_f_obj");
-                bigger_diam = preprocess_feature(bigger_diam, "bigger_diam");
-                diametro_pequeno = preprocess_feature(diametro_pequeno, "bigger_diam");
-
-                std::stringstream ss;
-                ss << std::fixed << std::setprecision(6);
-                ss << "{\"features\": [" 
-                   << variables << "," << restricciones << "," << depth << ","
-                   << ub_f_obj << "," << lb_f_obj << "," << bigger_diam << "," 
-                   << diametro_pequeno 
-                   << "]}"; 
-
-                python_timer.start();
-                std::string response = call_python_model(ss.str());
-                python_timer.stop();
-                g_python_time += python_timer.get_time();
-
-                int model_decision = parse_decision_from_json(response);
-                if (model_decision == -1) model_decision = 0; // Fallback
-
-                switch (model_decision) {
-                    case 0: chosen_bsc = &bsc; break;          
-                    case 1: chosen_bsc = &bisector_olf; break; 
-                    case 2: chosen_bsc = &bisector_rr; break;  
-                    case 3: chosen_bsc = &bisector_sm; break;  
-                    case 4: chosen_bsc = &bisector_ss; break;  
-                    case 5: chosen_bsc = &bisector_ssr; break; 
-                }
+            // [NUEVO] ¡SIN LA CONDICIÓN > 0, ENVÍA ESTADO EN EL NODO 0 Y HACE PING-PONG PERFECTO!
+            if (nb_cells > 0 && nb_cells % K_ITERATIONS == 0 && next_node == nullptr) {
+                uplo = buffer.minimum();
+                double current_gap = (loup == POS_INFINITY) ? 1e5 : (loup - uplo);
                 
-                selected_heuristic_id = model_decision; // Guardar ID para estadística
-                // std::cout << "Red Activada. Bisector: " << model_decision << std::endl;
-                std::cout << "Red Activada (" << iterations_without_improvement << " iters sin mejora). Bisector: "<< model_decision << std::endl;
-            } 
-            
-            // [NUEVO] Registrar Estadística
-            if (selected_heuristic_id >= 0 && selected_heuristic_id <= 6) {
-                g_bisector_counts[selected_heuristic_id]++;
+                double f1_log_nodos = log10(buffer.size() + 1.0); 
+                double f2_gap_pct = (initial_gap > 0) ? (current_gap / initial_gap) * 100.0 : 0.0;
+                double f3_time_pct = (timeout > 0) ? (time / timeout) * 100.0 : time;
+                double f4_mejora_lb = uplo - old_uplo;
+                double f5_accion_ant = (double)current_macro_action;
+
+                double alpha = 0.1;
+                double reward = (old_gap - current_gap) + (alpha * nodes_pruned_in_k_step);
+                
+                old_gap = current_gap;
+                old_uplo = uplo;
+                nodes_pruned_in_k_step = 0; 
+                
+                std::stringstream ss;
+                ss << "{ \"features\": [" 
+                   << f1_log_nodos << ", " << f2_gap_pct << ", " 
+                   << f3_time_pct << ", " << f4_mejora_lb << ", " << f5_accion_ant << "], "
+                   << "\"reward\": " << reward << ", "
+                   << "\"done\": false }\n";
+                
+                auto call_start = std::chrono::high_resolution_clock::now();
+                string json_response = call_python_model(ss.str());
+                auto call_end = std::chrono::high_resolution_clock::now();
+                g_python_time += std::chrono::duration<double>(call_end - call_start).count();
+
+                if (!json_response.empty()) {
+                    int decision = parse_decision_from_json(json_response);
+                    if (decision >= 0 && decision <= 3) {
+                        current_macro_action = decision; 
+                    }
+                }
             }
 
-            // =========================================================
-            //  FIN SELECCIÓN
-            // =========================================================
-            
-            thebuffer->pop(); 
-            if (trace>=2) { cout << " pop " << *c << endl; cout << " depth " << c->depth << endl; }
-            nb_cells++;
-            pair<Cell*,Cell*> new_cells=chosen_bsc->bisect(*c); 
-            if (trace>=2) { cout << " left " << *new_cells.first << endl; cout << " right " << *new_cells.second << endl; }
-            delete c;
-            if (new_cells.first) handle_cell(*new_cells.first);
-            if (new_cells.second) handle_cell(*new_cells.second);
-            update_uplo();
-            if (loup_changed) { if (trace) cout << "\033[32m loup= " << loup << "\033[0m" << endl; buffer.contract(loup); }
-            if (uplo>=loup) { status=SUCCESS; goto end; }
-            if (trace) { cout << " nb_cells=" << nb_cells << " buffer size=" << buffer.size() << " uplo=" << uplo << " loup=" << loup << endl; }
-            now = std::chrono::high_resolution_clock::now();
-            if (timeout>0 && timer.get_time()>timeout) { status=TIME_OUT; goto end; }
-        }
-        status=SUCCESS;
-    } catch (NoBisectableVariableException& ) { status=SUCCESS; }
+            loup_changed = false;
+            double old_loup_antes_de_biseccion = loup; 
 
-end:
-    timer.stop(); time=timer.get_time();
-    auto end_time = std::chrono::high_resolution_clock::now();
-    g_wall_time = std::chrono::duration_cast<std::chrono::seconds>(end_time - g_start_wall_time).count();
-    if (cov) { cov->data->_optim_time += time; cov->data->_optim_nb_cells += nb_cells; }
+            Cell *c = nullptr;
+
+            if (next_node != nullptr) {
+                c = next_node;
+                next_node = nullptr;
+            } 
+            else if (current_macro_action == 1) {
+                int batch_size = std::min((int)buffer.size(), 10);
+                std::vector<Cell*> batch;
+                for(int i = 0; i < batch_size; i++) {
+                    batch.push_back(buffer.top());
+                    buffer.pop();
+                }
+
+                int best_idx = 0;
+                alternate_fair = !alternate_fair;
+                
+                if (alternate_fair) {
+                    best_idx = 0;
+                } else {
+                    double min_ub = POS_INFINITY;
+                    for(int i = 0; i < batch_size; i++) {
+                        double current_ub = batch[i]->box[goal_var].ub();
+                        if (current_ub < min_ub) {
+                            min_ub = current_ub;
+                            best_idx = i;
+                        }
+                    }
+                }
+                c = batch[best_idx];
+                for(int i = 0; i < batch_size; i++) {
+                    if (i != best_idx) buffer.push(batch[i]);
+                }
+            } 
+            else {
+                c = buffer.top();
+                buffer.pop();
+            }
+
+            g_action_counts[current_macro_action]++;
+
+            if (trace >= 2) cout << " current box " << c->box << endl;
+
+            try {
+                pair<Cell*,Cell*> new_cells = bsc.bisect(*c);
+                delete c; 
+                nb_cells += 2; 
+
+                handle_cell(*new_cells.first);
+                handle_cell(*new_cells.second);
+
+                Cell* left_child = (new_cells.first->box.is_empty()) ? nullptr : new_cells.first;
+                Cell* right_child = (new_cells.second->box.is_empty()) ? nullptr : new_cells.second;
+
+                bool nuevo_ub_encontrado = (loup < old_loup_antes_de_biseccion);
+
+                if (left_child != nullptr && right_child != nullptr) {
+                    if (current_macro_action == 0 || current_macro_action == 1) {
+                        buffer.push(left_child);
+                        buffer.push(right_child);
+                    } 
+                    else if (current_macro_action == 2) {
+                        if (left_child->box[goal_var].lb() < right_child->box[goal_var].lb()) {
+                            next_node = left_child; buffer.push(right_child);
+                        } else {
+                            next_node = right_child; buffer.push(left_child);
+                        }
+                    } 
+                    else if (current_macro_action == 3) {
+                        if (nuevo_ub_encontrado) {
+                            if (left_child->box.intersects(loup_point)) {
+                                next_node = left_child; buffer.push(right_child);
+                            } else {
+                                next_node = right_child; buffer.push(left_child);
+                            }
+                        } else {
+                            if (left_child->box[goal_var].lb() < right_child->box[goal_var].lb()) {
+                                next_node = left_child; buffer.push(right_child);
+                            } else {
+                                next_node = right_child; buffer.push(left_child);
+                            }
+                        }
+                    }
+                } 
+                else if (left_child != nullptr) {
+                    if (current_macro_action == 2 || current_macro_action == 3) next_node = left_child;
+                    else buffer.push(left_child);
+                } 
+                else if (right_child != nullptr) {
+                    if (current_macro_action == 2 || current_macro_action == 3) next_node = right_child;
+                    else buffer.push(right_child);
+                } 
+                else {
+                    nodes_pruned_in_k_step++; 
+                }
+
+                if (uplo_of_epsboxes == NEG_INFINITY) break;
+                if (loup_changed) {
+                    double ymax = compute_ymax();
+                    buffer.contract(ymax);
+                    if (ymax <= NEG_INFINITY) break;
+                }
+                update_uplo();
+
+                if (!anticipated_upper_bounding) 
+                    if (get_obj_rel_prec()<rel_eps_f || get_obj_abs_prec()<abs_eps_f)
+                        break;
+
+                if (timeout>0) timer.check(timeout); 
+                time = timer.get_time();
+
+            }
+            catch (NoBisectableVariableException& ) {
+                update_uplo_of_epsboxes((c->box)[goal_var].lb());
+                delete c; 
+                update_uplo(); 
+            }
+        } // <- LLAVE RECIÉN RESTAURADA
+    }
+    catch (TimeOutException& ) {
+        status = TIME_OUT;
+    }
+
+    double final_gap = (loup == POS_INFINITY) ? 1e5 : (loup - uplo);
+    double terminal_gap_term = old_gap - final_gap;
+
+    double terminal_status_bonus;
+    switch (status) {
+        case SUCCESS:          terminal_status_bonus = TERMINAL_BONUS_SUCCESS; break;
+        case TIME_OUT:         terminal_status_bonus = TERMINAL_BONUS_TIMEOUT; break;
+        case UNREACHED_PREC:   terminal_status_bonus = TERMINAL_BONUS_UNREACHED_PREC; break;
+        default:               terminal_status_bonus = TERMINAL_BONUS_NEUTRAL; break;
+    }
+
+    double terminal_reward = terminal_gap_term + terminal_status_bonus;
+
+    std::stringstream ss_done;
+    ss_done << "{ \"features\": [0.0, 0.0, 0.0, 0.0, 0.0], \"reward\": " << terminal_reward << ", \"done\": true }\n";
+    call_python_model(ss_done.str());
+
+    for (int i=0; i<(extended_COV ? n+1 : n); i++)
+        cov->data->_optim_var_names.push_back(string(""));
+
+    cov->data->_optim_optimizer_status = (unsigned int) status;
+    cov->data->_optim_uplo = uplo;
+    cov->data->_optim_uplo_of_epsboxes = uplo_of_epsboxes;
+    cov->data->_optim_loup = loup;
+
+    cov->data->_optim_time += time;
+    cov->data->_optim_nb_cells += nb_cells;
+    cov->data->_optim_loup_point = loup_point;
+
+    IntervalVector tmp(extended_COV ? n+1 : n);
+
+    if (extended_COV) {
+        write_ext_box(loup_point, tmp);
+        tmp[goal_var] = Interval(uplo,loup);
+        cov->add(tmp);
+    }
+    else {
+        cov->add(loup_point);
+    }
+
+    while (!buffer.empty()) {
+        Cell* cell = buffer.top();
+        if (extended_COV)
+            cov->add(cell->box);
+        else {
+            read_ext_box(cell->box,tmp);
+            cov->add(tmp);
+        }
+        delete buffer.pop();
+    }
+
     return status;
 }
 
-// [NUEVO] Función Reporte Mejorada con Tabla de Bisectores
 void Optimizer::report() {
     cout << " optimization status:\t\t";
     if (status==SUCCESS) cout << "Success" << endl; else cout << "Time Out" << endl;
@@ -388,18 +466,15 @@ void Optimizer::report() {
     if (!loup_point.is_empty()) cout << " best point (x*):\t\t" << loup_point << endl;
     else cout << " best point (x*):\t\t(Ninguna solución factible encontrada)" << endl;
 
-    // --- TABLA DE ESTADÍSTICAS DE BISECTORES ---
-    cout << endl << " === Heuristic Usage Statistics ===" << endl;
-    cout << " ----------------------------------" << endl;
-    cout << "  0 (LSMEAR): " << g_bisector_counts[0] << endl;
-    cout << "  1 (LF)    : " << g_bisector_counts[1] << endl;
-    cout << "  2 (RR)    : " << g_bisector_counts[2] << endl;
-    cout << "  3 (SM)    : " << g_bisector_counts[3] << endl;
-    cout << "  4 (SS)    : " << g_bisector_counts[4] << endl;
-    cout << "  5 (SSR)   : " << g_bisector_counts[5] << endl;
-    cout << "  6 (Default): " << g_bisector_counts[6] << " (Red inactiva)" << endl;
-    cout << " ----------------------------------" << endl;
-    // -------------------------------------------
+    long total_actions = g_action_counts[0] + g_action_counts[1] + g_action_counts[2] + g_action_counts[3];
+    cout << endl << " === RL Node-Selection Heuristic Usage ===" << endl;
+    cout << " ------------------------------------------" << endl;
+    cout << "  0 (Best-First / minLB) : " << g_action_counts[0] << endl;
+    cout << "  1 (LBvUB)              : " << g_action_counts[1] << endl;
+    cout << "  2 (FeasibleDiving)     : " << g_action_counts[2] << endl;
+    cout << "  3 (FeasibleDivingUB)   : " << g_action_counts[3] << endl;
+    cout << " ------------------------------------------" << endl;
+    cout << "  total node extractions : " << total_actions << endl;
 
     if (statistics) cout << endl << "  ===== Statistics ====" << endl << endl << *statistics << endl;
 }
