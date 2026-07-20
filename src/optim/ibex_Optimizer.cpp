@@ -1,7 +1,3 @@
-//                                  I B E X
-// File        : ibex_Optimizer.cpp (RL DYNAMIC HYPER-HEURISTIC FOR NODE SELECTION)
-//============================================================================
-
 #include "ibex_Optimizer.h"
 #include "ibex_Timer.h"
 #include "ibex_Function.h"
@@ -18,12 +14,14 @@
 #include <stdlib.h>
 #include <vector>
 #include <queue>
+#include <unordered_set>
+#include <unordered_map>
 #include <iomanip>
 #include <chrono>
 #include <limits> 
 #include <cmath>
 #include <sstream>
-#include <sys/socket.h> //Comunicación con el modelo Python
+#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <string>
@@ -91,14 +89,26 @@ int parse_decision_from_json(const std::string& json_str) {
 
 namespace ibex {
     
-//int nodes_pruned_in_k_step = 0;  
-
 // Variables para el estado del RL y el Diving
 Cell* dive_next = nullptr; 
 double old_gap = POS_INFINITY;
 int current_macro_action = 0; 
 int iterations_in_macro_step = 0;
 int current_k_target = 100; // iteraciones dinámicas
+
+// TWO HEAPS 
+struct CompareUBHeap {
+    int goal_var;
+    CompareUBHeap(int g) : goal_var(g) {}
+
+    bool operator()(const ibex::Cell* a, const ibex::Cell* b) const {
+        double ub_a = a->box[goal_var].ub();
+        double ub_b = b->box[goal_var].ub();
+        if (ub_a != ub_b) return ub_a > ub_b; 
+        return a > b; // Pointer fallback to ensure deterministic strict ordering
+    }
+};
+
 /*
  * TODO: redundant with ExtendedSystem.
  */
@@ -117,6 +127,7 @@ void Optimizer::read_ext_box(const IntervalVector& ext_box, IntervalVector& box)
         box[i]=ext_box[i2];
     }
 }
+
 Optimizer::Optimizer(int n, Ctc& ctc, Bsc& bsc, LoupFinder& finder,
         CellBufferOptim& buffer,
         int goal_var, double eps_x, double rel_eps_f, double abs_eps_f,
@@ -181,7 +192,6 @@ double Optimizer::compute_ymax() {
 }
 
 bool Optimizer::update_loup(const IntervalVector& box, BoxProperties& prop) {
-
     try {
         pair<IntervalVector,double> p=loup_finder.find(box,loup_point,loup,prop);
         loup_point = p.first;
@@ -348,21 +358,16 @@ void Optimizer::start(const IntervalVector& init_box, double obj_init_bound) {
     cov->data->_optim_time = 0;
     cov->data->_optim_nb_cells = 0;
 
-    for(int k=0; k<4; k++) g_action_counts[k] = 0;//NUEVO NO SE SI ESTA BUENO
+    for(int k=0; k<4; k++) g_action_counts[k] = 0;
 
     handle_cell(*root);
 
-    // =========================================================================
-    // NUEVO: NOTIFICACIÓN DE ESTADO INICIAL PARA EL AGENTE RL
-    // =========================================================================
-    // 1. Limpiar variables del episodio anterior para no heredar basura
     iterations_in_macro_step = 0;
-    current_k_target = 100; //iteraciones dinámicas
+    current_k_target = 100;
     dive_next = nullptr;
     old_gap = POS_INFINITY;
     current_macro_action = 0; 
     
-    // 2. Calcular estado inicial exacto
     double current_gap = loup - uplo;
     
     double f1_log_nodos = std::log10(buffer.size() + 1.0);
@@ -377,11 +382,10 @@ void Optimizer::start(const IntervalVector& init_box, double obj_init_bound) {
         f2_gap_pct = log_gap / (1.0 + log_gap); 
     }
     
-    double f3_time_pct = 0.0; // Tiempo en 0
-    double f4_depth = 0.0;    // Profundidad en 0 (Raíz)
-    int f5_accion_ant = 0;    // Acción por defecto
+    double f3_time_pct = 0.0;
+    double f4_depth = 0.0;
+    int f5_accion_ant = 0;
     
-    // 3. Empaquetar y enviar a Python
     std::stringstream ss;
     ss << "{ \"features\": [" 
        << f1_log_nodos << ", " << f2_gap_pct << ", " 
@@ -391,7 +395,6 @@ void Optimizer::start(const IntervalVector& init_box, double obj_init_bound) {
        
     string json_response = call_python_model(ss.str());
     
-    // 4. Configurar la primera acción elegida por el modelo para este episodio
     if (!json_response.empty()) {
         int decision = parse_decision_from_json(json_response);
         if (decision >= 0 && decision <= 3) {
@@ -399,7 +402,6 @@ void Optimizer::start(const IntervalVector& init_box, double obj_init_bound) {
         }
     }
     old_gap = current_gap;
-
 }
 
 void Optimizer::start(const CovOptimData& data, double obj_init_bound) {
@@ -442,11 +444,8 @@ void Optimizer::start(const CovOptimData& data, double obj_init_bound) {
 
     for(int k=0; k<4; k++) g_action_counts[k] = 0;
 
-    // =========================================================================
-    // NUEVO: NOTIFICACIÓN DE ESTADO INICIAL PARA EL AGENTE RL
-    // =========================================================================
     iterations_in_macro_step = 0;
-    current_k_target = 100; //iteraciones dinámicas
+    current_k_target = 100;
     dive_next = nullptr;
     old_gap = POS_INFINITY;
     current_macro_action = 0; 
@@ -493,9 +492,36 @@ Optimizer::Status Optimizer::optimize() {
 
     update_uplo();
 
+    // =========================================================================
+    // INITIALIZE TWO HEAPS DATA STRUCTURES
+    // =========================================================================
+    CompareUBHeap cmp(goal_var);
+    std::priority_queue<ibex::Cell*, std::vector<ibex::Cell*>, CompareUBHeap> ub_heap(cmp);
+    std::unordered_set<ibex::Cell*> active_cells;
+    std::unordered_map<ibex::Cell*, int> ref_count; // Tracks queue references
+
+    std::vector<ibex::Cell*> init_cells;
+    while (!buffer.empty()) {
+        init_cells.push_back(buffer.top());
+        buffer.pop();
+    }
+    for (ibex::Cell* c : init_cells) {
+        buffer.push(c);
+        ub_heap.push(c);
+        active_cells.insert(c);
+        ref_count[c] = 2; 
+    }
+
+    auto push_to_queues = [&](ibex::Cell* child) {
+        buffer.push(child);
+        ub_heap.push(child);
+        active_cells.insert(child);
+        ref_count[child] = 2;
+    };
+
     try {
-        // UNIFIED LOOP: This is the single loop that processes nodes.
-        while (!buffer.empty() || dive_next != nullptr) {
+        // UNIFIED LOOP: Processing active nodes and pending dives
+        while (!active_cells.empty() || dive_next != nullptr) {
             loup_changed = false;
             Cell* c = nullptr;
 
@@ -503,73 +529,53 @@ Optimizer::Status Optimizer::optimize() {
             // 1. SELECCIÓN DE NODO (NODE SELECTION)
             // ---------------------------------------------------------
             if (dive_next != nullptr) {
-                // Un nodo pendiente de un dive anterior tiene prioridad SIEMPRE,
-                // incluso si el agente ya cambió de heurística en esta ventana.
-                // Si no lo drenamos aquí, queda huérfano (fuga de memoria) o —
-                // peor — sigue manteniendo vivo el "while" de más abajo aunque
-                // el buffer real esté vacío, y las ramas 0/1 intentarían hacer
-                // buffer.top()/pop() sobre un buffer vacío.
                 c = dive_next;
                 dive_next = nullptr;
-            }
-            else if (current_macro_action == 2 || current_macro_action == 3) {
-                // Estrategia: Feasible Diving (no hay dive pendiente, iniciamos uno)
-                c = buffer.top();
-                buffer.pop();
-            } 
-            else if (current_macro_action == 1) {
-                // Estrategia: LBvUB (Araya & Neveu)
-                if (static_cast<double>(rand()) / RAND_MAX < 0.5) {
-                    c = buffer.top();
-                    buffer.pop();
-                } else {
-                    std::vector<Cell*> temp_buffer;
-                    double min_ub = POS_INFINITY;
-                    Cell* best_ub_cell = nullptr;
-                    // Búsqueda segura: limitada al tamaño real del buffer
-                    int search_depth = std::min((int)buffer.size(), 100); 
-
-                    for (int i = 0; i < search_depth; ++i) {
-                        if (buffer.empty()) break; 
-                        
-                        Cell* curr = buffer.top();
+            } else {
+                bool use_ub = (current_macro_action == 1) && (static_cast<double>(rand()) / RAND_MAX >= 0.5);
+                
+                while (!active_cells.empty()) {
+                    if (use_ub && !ub_heap.empty()) {
+                        c = ub_heap.top();
+                        ub_heap.pop();
+                        auto it = ref_count.find(c);
+                        if (it != ref_count.end()) it->second--;
+                    } else if (!buffer.empty()) {
+                        c = buffer.top();
                         buffer.pop();
-                        double curr_ub = curr->box[goal_var].ub();
-                        if (curr_ub < min_ub) {
-                            min_ub = curr_ub;
-                            if (best_ub_cell) temp_buffer.push_back(best_ub_cell);
-                            best_ub_cell = curr;
-                        } else {
-                            temp_buffer.push_back(curr);
-                        }
-                    }
-                    
-                    if (best_ub_cell != nullptr) {
-                        c = best_ub_cell;
-                    } else if (!temp_buffer.empty()) {
-                         c = temp_buffer.front();
-                         temp_buffer.erase(temp_buffer.begin());
+                        auto it = ref_count.find(c);
+                        if (it != ref_count.end()) it->second--;
                     } else {
-                        if (!buffer.empty()) {
-                             c = buffer.top();
-                             buffer.pop();
-                        }
+                        c = nullptr;
+                        break;
                     }
 
-                    // Devolver los nodos evaluados a la cola
-                    for (Cell* temp_cell : temp_buffer) buffer.push(temp_cell);
+                    if (c && active_cells.erase(c)) {
+                        break; 
+                    } else if (c) {
+                        auto it = ref_count.find(c);
+                        if (it != ref_count.end() && it->second <= 0) {
+                            ref_count.erase(it);
+                            delete c;
+                        }
+                        c = nullptr;
+                    }
                 }
-            } 
-            else {
-                // Estrategia 0: Best-First (minLB)
-                c = buffer.top();
-                buffer.pop();
             }
 
-            // Si c es nulo, saltamos con seguridad
-            if (!c) continue;
+            if (!c) continue; 
 
-            // [CORRECCIÓN 1] Mover iterador RL aquí para contabilizar la extracción real
+            // ---------------------------------------------------------
+            // 1b. LÓGICA DE PODA PEREZOSA (LAZY PRUNING)
+            // ---------------------------------------------------------
+            if (c->box[goal_var].lb() > compute_ymax()) {
+                auto it = ref_count.find(c);
+                if (it == ref_count.end()) {
+                    delete c;
+                }
+                continue;
+            }
+
             iterations_in_macro_step++;
             int current_depth = c->depth;
             g_action_counts[current_macro_action]++;
@@ -581,22 +587,14 @@ Optimizer::Status Optimizer::optimize() {
             // ---------------------------------------------------------
             try {
                 pair<Cell*,Cell*> new_cells = bsc.bisect(*c);
-                delete c; 
+                
+                auto it = ref_count.find(c);
+                if (it == ref_count.end()) {
+                    delete c;
+                }
                 c = nullptr; 
                 nb_cells += 2; 
 
-                // ---------------------------------------------------------
-                // 2b. CONTRACT & BOUND DE CADA HIJO (sin decidir destino aún)
-                // ---------------------------------------------------------
-                // A propósito NO usamos handle_cell() aquí: handle_cell ya
-                // decide push(buffer) / delete internamente. Si lo llamamos y
-                // LUEGO volvemos a tocar el mismo puntero para asignarlo a
-                // dive_next o a buffer, el mismo Cell* queda insertado DOS
-                // VECES en el heap (doble-push -> doble-free más adelante), o
-                // si la caja quedó vacía, leemos ->box.is_empty() sobre un
-                // puntero que handle_cell ya liberó (use-after-free). Por eso
-                // contraemos manualmente y decidimos el destino UNA sola vez
-                // por hijo: buffer, dive_next, o delete.
                 Cell* child1 = new_cells.first;
                 Cell* child2 = new_cells.second;
 
@@ -619,13 +617,13 @@ Optimizer::Status Optimizer::optimize() {
                             : (child1->box[goal_var].ub() < child2->box[goal_var].ub());
 
                         dive_next = prefer_child1 ? child1 : child2;
-                        buffer.push(prefer_child1 ? child2 : child1); 
+                        push_to_queues(prefer_child1 ? child2 : child1); 
                     } 
                     else if (child1) dive_next = child1;
                     else if (child2) dive_next = child2;
                 } else {
-                    if (child1) buffer.push(child1);
-                    if (child2) buffer.push(child2);
+                    if (child1) push_to_queues(child1);
+                    if (child2) push_to_queues(child2);
                 }
 
                 // ---------------------------------------------------------
@@ -637,7 +635,6 @@ Optimizer::Status Optimizer::optimize() {
 
                 if (loup_changed) {
                     double ymax = compute_ymax();
-                    buffer.contract(ymax);
                     if (ymax <= NEG_INFINITY) {
                         if (trace) cout << " infinite value for the minimum " << endl;
                         break;
@@ -655,19 +652,19 @@ Optimizer::Status Optimizer::optimize() {
             catch (NoBisectableVariableException& ) {
                 if (c) {
                     update_uplo_of_epsboxes((c->box)[goal_var].lb());
-                    delete c; 
+                    auto it = ref_count.find(c);
+                    if (it == ref_count.end()) {
+                        delete c;
+                    }
                     c = nullptr; 
                 }
                 update_uplo(); 
-                
-                // Si la bisección falla, se salta la actualización RL en este turno para evitar cálculos inválidos
                 continue; 
             }
 
             // ---------------------------------------------------------
             // 5. CONTROL DEL AGENTE RL (RL AGENT CONTROL)
             // ---------------------------------------------------------
-            // iterations_in_macro_step ya fue incrementado en el paso 1
             if (iterations_in_macro_step >= current_k_target) {
                 
                 double current_gap = loup - uplo;
@@ -683,7 +680,7 @@ Optimizer::Status Optimizer::optimize() {
                     gap_reward = 10.0; 
                 }
                 
-                double f1_log_nodos = std::log10(buffer.size() + 1.0);
+                double f1_log_nodos = std::log10(active_cells.size() + 1.0);
                 f1_log_nodos = f1_log_nodos / (f1_log_nodos + 2.0); 
                 
                 double f2_gap_pct;
@@ -723,33 +720,20 @@ Optimizer::Status Optimizer::optimize() {
                         current_macro_action = decision;
                     }
                 }
-                // =======================================================
-                // NUEVO: CALCULAR EL PRÓXIMO K_TARGET DINÁMICO
-                // =======================================================
-                // El nuevo K será el 5% del tamaño actual del buffer.
-                // Lo acotamos entre un mínimo de 100 y un máximo de 1000 iteraciones.
-                int buffer_size = buffer.size();
+
+                int buffer_size = active_cells.size();
                 int proposed_k = static_cast<int>(buffer_size * 0.05);
                 
-                if (proposed_k < 100) {
-                    current_k_target = 100;
-                } else if (proposed_k > 1000) {
-                    current_k_target = 1000;
-                } else {
-                    current_k_target = proposed_k;
-                }
-                // =======================================================
+                if (proposed_k < 100) current_k_target = 100;
+                else if (proposed_k > 1000) current_k_target = 1000;
+                else current_k_target = proposed_k;
             }
 
-            // Chequeo de terminación por convergencia o tiempo
             if (uplo >= loup) { status = SUCCESS; goto end; }
             if (timeout > 0) timer.check(timeout);
             time = timer.get_time();
         } 
 
-        // =========================================================
-        // FINALIZACIÓN DEL BUCLE (TERMINATION HANDLING)
-        // =========================================================
         timer.stop();
         time = timer.get_time();
 
@@ -785,7 +769,6 @@ end:
         close_model_connection();
     }
 
-    // [CORRECCIÓN 3] Liberar dive_next en cualquier salida posible
     if (dive_next != nullptr) {
         delete dive_next;
         dive_next = nullptr;
@@ -813,18 +796,25 @@ end:
         cov->add(loup_point);
     }
 
+    std::unordered_set<ibex::Cell*> all_remaining_cells;
     while (!buffer.empty()) {
-        // [CORRECCIÓN 2] Vaciar el buffer evitando pop() devuelva void
-        Cell* cell = buffer.top();
-        if (extended_COV)
-            cov->add(cell->box);
-        else {
-            read_ext_box(cell->box,tmp);
-            cov->add(tmp);
-        }
+        all_remaining_cells.insert(buffer.top());
         buffer.pop();
+    }
+    while (!ub_heap.empty()) {
+        all_remaining_cells.insert(ub_heap.top());
+        ub_heap.pop();
+    }
+    for (ibex::Cell* cell : all_remaining_cells) {
+        if (active_cells.count(cell)) {
+            if (extended_COV) cov->add(cell->box);
+            else { read_ext_box(cell->box, tmp); cov->add(tmp); }
+        }
         delete cell;
     }
+
+    active_cells.clear();
+    ref_count.clear();
 
     return status;
 }
@@ -924,10 +914,7 @@ void Optimizer::report() {
         cout << " [total=" << cov->nb_cells() << "]";
     cout << endl << endl;
     
-
-    // ========================================================
-    // [AÑADIR TODO ESTE BLOQUE] Imprimir la tabla de RL
-    // ========================================================
+    
     long total_actions = g_action_counts[0] + g_action_counts[1] + g_action_counts[2] + g_action_counts[3];
     cout << " === RL Node-Selection Heuristic Usage ===" << endl;
     cout << " ------------------------------------------" << endl;
