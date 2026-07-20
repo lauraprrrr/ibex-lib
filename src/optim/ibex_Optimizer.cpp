@@ -98,7 +98,7 @@ Cell* dive_next = nullptr;
 double old_gap = POS_INFINITY;
 int current_macro_action = 0; 
 int iterations_in_macro_step = 0;
-const int K_ITERATIONS = 100;
+int current_k_target = 100; // iteraciones dinámicas
 /*
  * TODO: redundant with ExtendedSystem.
  */
@@ -348,6 +348,8 @@ void Optimizer::start(const IntervalVector& init_box, double obj_init_bound) {
     cov->data->_optim_time = 0;
     cov->data->_optim_nb_cells = 0;
 
+    for(int k=0; k<4; k++) g_action_counts[k] = 0;//NUEVO NO SE SI ESTA BUENO
+
     handle_cell(*root);
 
     // =========================================================================
@@ -355,6 +357,7 @@ void Optimizer::start(const IntervalVector& init_box, double obj_init_bound) {
     // =========================================================================
     // 1. Limpiar variables del episodio anterior para no heredar basura
     iterations_in_macro_step = 0;
+    current_k_target = 100; //iteraciones dinámicas
     dive_next = nullptr;
     old_gap = POS_INFINITY;
     current_macro_action = 0; 
@@ -437,10 +440,13 @@ void Optimizer::start(const CovOptimData& data, double obj_init_bound) {
     cov->data->_optim_time = data.time();
     cov->data->_optim_nb_cells = data.nb_cells();
 
+    for(int k=0; k<4; k++) g_action_counts[k] = 0;
+
     // =========================================================================
     // NUEVO: NOTIFICACIÓN DE ESTADO INICIAL PARA EL AGENTE RL
     // =========================================================================
     iterations_in_macro_step = 0;
+    current_k_target = 100; //iteraciones dinámicas
     dive_next = nullptr;
     old_gap = POS_INFINITY;
     current_macro_action = 0; 
@@ -662,7 +668,7 @@ Optimizer::Status Optimizer::optimize() {
             // 5. CONTROL DEL AGENTE RL (RL AGENT CONTROL)
             // ---------------------------------------------------------
             // iterations_in_macro_step ya fue incrementado en el paso 1
-            if (iterations_in_macro_step >= K_ITERATIONS) {
+            if (iterations_in_macro_step >= current_k_target) {
                 
                 double current_gap = loup - uplo;
                 double gap_reward = 0.0;
@@ -717,6 +723,22 @@ Optimizer::Status Optimizer::optimize() {
                         current_macro_action = decision;
                     }
                 }
+                // =======================================================
+                // NUEVO: CALCULAR EL PRÓXIMO K_TARGET DINÁMICO
+                // =======================================================
+                // El nuevo K será el 5% del tamaño actual del buffer.
+                // Lo acotamos entre un mínimo de 100 y un máximo de 1000 iteraciones.
+                int buffer_size = buffer.size();
+                int proposed_k = static_cast<int>(buffer_size * 0.05);
+                
+                if (proposed_k < 100) {
+                    current_k_target = 100;
+                } else if (proposed_k > 1000) {
+                    current_k_target = 1000;
+                } else {
+                    current_k_target = proposed_k;
+                }
+                // =======================================================
             }
 
             // Chequeo de terminación por convergencia o tiempo
@@ -902,6 +924,21 @@ void Optimizer::report() {
         cout << " [total=" << cov->nb_cells() << "]";
     cout << endl << endl;
     
+
+    // ========================================================
+    // [AÑADIR TODO ESTE BLOQUE] Imprimir la tabla de RL
+    // ========================================================
+    long total_actions = g_action_counts[0] + g_action_counts[1] + g_action_counts[2] + g_action_counts[3];
+    cout << " === RL Node-Selection Heuristic Usage ===" << endl;
+    cout << " ------------------------------------------" << endl;
+    cout << "  0 (Best-First / minLB) : " << g_action_counts[0] << endl;
+    cout << "  1 (LBvUB)              : " << g_action_counts[1] << endl;
+    cout << "  2 (FeasibleDiving)     : " << g_action_counts[2] << endl;
+    cout << "  3 (FeasibleDivingUB)   : " << g_action_counts[3] << endl;
+    cout << " ------------------------------------------" << endl;
+    cout << "  total node extractions : " << total_actions << endl << endl;
+    // ========================================================
+
     if (statistics) 
         cout << "  ===== Statistics ====" << endl << endl << *statistics << endl;
 }
