@@ -1,3 +1,7 @@
+//                                  I B E X
+// File        : ibex_Optimizer.cpp (RL DYNAMIC HYPER-HEURISTIC FOR NODE SELECTION)
+//============================================================================
+
 #include "ibex_Optimizer.h"
 #include "ibex_Timer.h"
 #include "ibex_Function.h"
@@ -95,6 +99,12 @@ double old_gap = POS_INFINITY;
 int current_macro_action = 0; 
 int iterations_in_macro_step = 0;
 int current_k_target = 100; // iteraciones dinámicas
+
+// ============================================================================
+// [NEW] Tracking variables for Path-Switching Penalty (Tree Dispersion)
+// ============================================================================
+int previous_node_depth = -1;
+int accumulated_depth_jumps = 0;
 
 // TWO HEAPS 
 struct CompareUBHeap {
@@ -367,6 +377,12 @@ void Optimizer::start(const IntervalVector& init_box, double obj_init_bound) {
     dive_next = nullptr;
     old_gap = POS_INFINITY;
     current_macro_action = 0; 
+
+    // =========================================================================
+    // [NEW] Reset Path-Switching variables at the start of a new episode
+    // =========================================================================
+    previous_node_depth = -1;
+    accumulated_depth_jumps = 0;
     
     double current_gap = loup - uplo;
     
@@ -449,6 +465,12 @@ void Optimizer::start(const CovOptimData& data, double obj_init_bound) {
     dive_next = nullptr;
     old_gap = POS_INFINITY;
     current_macro_action = 0; 
+
+    // =========================================================================
+    // [NEW] Reset Path-Switching variables at the start of a new episode
+    // =========================================================================
+    previous_node_depth = -1;
+    accumulated_depth_jumps = 0;
     
     double current_gap = loup - uplo;
     
@@ -580,6 +602,15 @@ Optimizer::Status Optimizer::optimize() {
             int current_depth = c->depth;
             g_action_counts[current_macro_action]++;
 
+            // =========================================================
+            // [NEW] TRACK PATH-SWITCHING (Erratic Tree Jumps)
+            // Accumulate absolute differences in depth between consecutive nodes
+            // =========================================================
+            if (previous_node_depth != -1) {
+                accumulated_depth_jumps += std::abs(current_depth - previous_node_depth);
+            }
+            previous_node_depth = current_depth;
+
             if (trace >= 2) cout << " current box " << c->box << endl;
 
             // ---------------------------------------------------------
@@ -680,6 +711,17 @@ Optimizer::Status Optimizer::optimize() {
                     gap_reward = 10.0; 
                 }
                 
+                // =======================================================
+                // [NEW] CALCULATE PATH-SWITCHING PENALTY
+                // =======================================================
+                double avg_depth_jump = static_cast<double>(accumulated_depth_jumps) / std::max(1, iterations_in_macro_step);
+                double beta = 0.05; // Tunable scaling factor for the penalty
+                double path_switching_penalty = beta * avg_depth_jump;
+                
+                // Deduct the path-switching penalty from the standard gap reward
+                double step_reward = gap_reward - path_switching_penalty;
+                // =======================================================
+
                 double f1_log_nodos = std::log10(active_cells.size() + 1.0);
                 f1_log_nodos = f1_log_nodos / (f1_log_nodos + 2.0); 
                 
@@ -703,7 +745,7 @@ Optimizer::Status Optimizer::optimize() {
                 ss << "{ \"features\": [" 
                    << f1_log_nodos << ", " << f2_gap_pct << ", " 
                    << f3_time_pct << ", " << f4_depth << ", " << f5_accion_ant << "], "
-                   << "\"reward\": " << gap_reward << ", "
+                   << "\"reward\": " << step_reward << ", " // [NEW] Using penalized reward
                    << "\"done\": false }\n";
                 
                 auto call_start = std::chrono::high_resolution_clock::now();
@@ -711,8 +753,10 @@ Optimizer::Status Optimizer::optimize() {
                 auto call_end = std::chrono::high_resolution_clock::now();
                 g_python_time += std::chrono::duration<double>(call_end - call_start).count();
 
+                // Reset variables for the next macro-step
                 old_gap = current_gap;
                 iterations_in_macro_step = 0;
+                accumulated_depth_jumps = 0; // [NEW] Reset tree dispersion tracker
 
                 if (!json_response.empty()) {
                     int decision = parse_decision_from_json(json_response);
@@ -924,7 +968,6 @@ void Optimizer::report() {
     cout << "  3 (FeasibleDivingUB)   : " << g_action_counts[3] << endl;
     cout << " ------------------------------------------" << endl;
     cout << "  total node extractions : " << total_actions << endl << endl;
-    // ========================================================
 
     if (statistics) 
         cout << "  ===== Statistics ====" << endl << endl << *statistics << endl;
