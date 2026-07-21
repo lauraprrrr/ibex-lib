@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <vector>
 #include <queue>
+#include <algorithm>
 #include <unordered_set>
 #include <unordered_map>
 #include <iomanip>
@@ -105,6 +106,15 @@ int current_k_target = 100; // iteraciones dinámicas
 // ============================================================================
 int previous_node_depth = -1;
 int accumulated_depth_jumps = 0;
+
+// ============================================================================
+// [NEW] Dynamic normalization reference for the path-switching penalty.
+// Tracks the deepest node processed so far in the *current* episode, so the
+// penalty can be judged relative to how deep this particular problem's tree
+// actually gets, instead of using a fixed absolute scale that unfairly
+// punishes intrinsically deep trees (e.g. MINLP instances like "gear").
+// ============================================================================
+int max_depth_seen = 0;
 
 // TWO HEAPS 
 struct CompareUBHeap {
@@ -383,6 +393,7 @@ void Optimizer::start(const IntervalVector& init_box, double obj_init_bound) {
     // =========================================================================
     previous_node_depth = -1;
     accumulated_depth_jumps = 0;
+    max_depth_seen = 0; // [NEW] Reset per-episode max-depth normalization reference
     
     double current_gap = loup - uplo;
     
@@ -471,6 +482,7 @@ void Optimizer::start(const CovOptimData& data, double obj_init_bound) {
     // =========================================================================
     previous_node_depth = -1;
     accumulated_depth_jumps = 0;
+    max_depth_seen = 0; // [NEW] Reset per-episode max-depth normalization reference
     
     double current_gap = loup - uplo;
     
@@ -611,6 +623,14 @@ Optimizer::Status Optimizer::optimize() {
             }
             previous_node_depth = current_depth;
 
+            // [NEW] Update the deepest point reached so far this episode. This is
+            // the normalization reference used by the path-switching penalty below,
+            // so that intrinsically deep trees (e.g. MINLP "gear") are judged by
+            // *relative* depth jumps rather than absolute ones.
+            if (current_depth > max_depth_seen) {
+                max_depth_seen = current_depth;
+            }
+
             if (trace >= 2) cout << " current box " << c->box << endl;
 
             // ---------------------------------------------------------
@@ -712,11 +732,24 @@ Optimizer::Status Optimizer::optimize() {
                 }
                 
                 // =======================================================
-                // [NEW] CALCULATE PATH-SWITCHING PENALTY
+                // [NEW] CALCULATE PATH-SWITCHING PENALTY (dynamically depth-normalized)
                 // =======================================================
                 double avg_depth_jump = static_cast<double>(accumulated_depth_jumps) / std::max(1, iterations_in_macro_step);
                 double beta = 0.05; // Tunable scaling factor for the penalty
-                double path_switching_penalty = beta * avg_depth_jump;
+
+                // [NEW] Normalize against max_depth_seen (the deepest node processed
+                // so far this episode) instead of penalizing the raw depth jump. A
+                // jump of, say, 40 levels is trivial in a tree that reaches depth
+                // 2000 (typical for deep MINLP instances like "gear") but severe in
+                // one that tops out at depth 50. Dividing by max_depth_seen rescales
+                // avg_depth_jump into a bounded ~[0,1] "fraction of the tree spanned
+                // per jump", so beta behaves consistently across problems of very
+                // different intrinsic depth instead of stalling the agent on deep
+                // trees. max_depth_seen only grows within an episode (reset in
+                // start()), so it always reflects this problem's own scale.
+                double safe_max_depth = static_cast<double>(std::max(1, max_depth_seen));
+                double normalized_depth_jump = avg_depth_jump / safe_max_depth;
+                double path_switching_penalty = beta * normalized_depth_jump;
                 
                 // Deduct the path-switching penalty from the standard gap reward
                 double step_reward = gap_reward - path_switching_penalty;
