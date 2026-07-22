@@ -119,9 +119,7 @@ class AgenteDQN:
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
 
-# ==========================================
-# 4. BUCLE PRINCIPAL UNIFICADO
-# ==========================================
+
 def main():
     print("==================================================")
     print(" INICIANDO ENTRENAMIENTO DE HIPER-HEURÍSTICA RL")
@@ -135,7 +133,8 @@ def main():
     pasos_totales = 0
 
     try:
-        while True: # Bucle infinito (cada iteración es un archivo procesado por Ibex)
+        while True: 
+            
             estado, _ = env.reset()
             episodio_recompensa = 0
             loss_promedio = []
@@ -153,8 +152,7 @@ def main():
                 if not done:
                     recompensa = reward_norm.normalize(recompensa_cruda)
                 else:
-                    recompensa = recompensa_cruda # Recompensa terminal (+5 o -5) se mantiene
-
+                    recompensa = recompensa_cruda 
                 # 4. Memoria y Aprendizaje
                 agente.memoria.guardar_experiencia(estado, accion, recompensa, siguiente_estado, done)
                 loss = agente.aprender_de_memoria()
